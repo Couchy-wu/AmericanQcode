@@ -1,0 +1,37 @@
+# AmericanQcode Global Configuration
+# Sensitive values should be set via environment variables or .env file.
+
+providers:
+  primary: yahoo          # yahoo / polygon / alpha_vantage
+  fallback: polygon
+  polygon_api_key: ${POLYGON_API_KEY}
+  alpha_vantage_key: ${ALPHA_VANTAGE_KEY}
+
+polling:
+  interval_minutes: 5
+  market_session_only: true
+  max_parallel_requests: 10
+
+scanner:
+  max_signals_per_scan: 50
+  min_confidence: 0.6
+  dedup_window_bars: 3
+
+backtest:
+  default_capital: 100000.0
+  commission_per_share: 0.005
+  slippage_bps: 5            # basis points
+
+web:
+  host: "0.0.0.0"
+  port: 8080
+  auto_reload: false
+
+database:
+  url: "sqlite+aiosqlite:///data/market.db"
+  echo: false
+
+logging:
+  level: INFO
+  file: data/logs/app.log
+  rotation: "10 MB"

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Chart — {{ ticker }} | AmericanQcode{% endblock %}
+
+{% block content %}
+<div class="chart-detail">
+    <div class="panel-header">
+        <h2>{{ ticker }} — Detailed Chart</h2>
+        <div class="chart-controls">
+            <select id="chart-interval">
+                <option value="1d">Daily</option>
+                <option value="1h">Hourly</option>
+                <option value="15m">15 Min</option>
+                <option value="5m">5 Min</option>
+                <option value="1m">1 Min</option>
+            </select>
+            <span id="chart-price" class="price-display">--</span>
+        </div>
+    </div>
+    <div id="detail-chart" style="height: 700px;"></div>
+
+    <!-- Recent signals for this ticker -->
+    <div class="ticker-signals">
+        <h3>Recent Signals</h3>
+        <div id="ticker-signal-list"></div>
+    </div>
+</div>
+
+<script>
+const TICKER = "{{ ticker }}";
+</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/chart.js"></script>
+{% endblock %}

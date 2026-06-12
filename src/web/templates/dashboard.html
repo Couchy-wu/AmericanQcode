@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — AmericanQcode{% endblock %}
+
+{% block content %}
+<div class="dashboard-grid">
+    <!-- Market Info Bar -->
+    <div class="market-bar">
+        <div class="market-info">
+            <h2>Market Status</h2>
+            <span id="market-state" class="badge">--</span>
+            <div id="market-times"></div>
+        </div>
+        <div class="signal-summary">
+            <div class="summary-card bullish">
+                <span class="label">Bullish</span>
+                <span class="count" id="bullish-count">0</span>
+            </div>
+            <div class="summary-card bearish">
+                <span class="label">Bearish</span>
+                <span class="count" id="bearish-count">0</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chart Panel -->
+    <div class="chart-panel">
+        <div class="panel-header">
+            <h2>Candlestick Chart</h2>
+            <div class="chart-controls">
+                <select id="chart-ticker">
+                    <option value="AAPL">AAPL</option>
+                    <option value="MSFT">MSFT</option>
+                    <option value="GOOGL">GOOGL</option>
+                    <option value="AMZN">AMZN</option>
+                    <option value="TSLA">TSLA</option>
+                    <option value="META">META</option>
+                    <option value="NVDA">NVDA</option>
+                    <option value="SPY">SPY</option>
+                </select>
+                <select id="chart-interval">
+                    <option value="1d">Daily</option>
+                    <option value="1h">Hourly</option>
+                    <option value="5m">5 Min</option>
+                </select>
+                <label><input type="checkbox" id="toggle-ma" checked> MA</label>
+                <label><input type="checkbox" id="toggle-bb" checked> BB</label>
+                <label><input type="checkbox" id="toggle-macd" checked> MACD</label>
+                <label><input type="checkbox" id="toggle-rsi" checked> RSI</label>
+            </div>
+        </div>
+        <div id="main-chart" style="height: 600px;"></div>
+    </div>
+
+    <!-- Signal Feed -->
+    <div class="signal-panel">
+        <div class="panel-header">
+            <h2>Live Signal Feed</h2>
+            <span id="signal-count" class="badge">0 signals</span>
+        </div>
+        <div id="signal-feed" class="signal-feed">
+            <p class="empty-state">Waiting for signals...</p>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/chart.js"></script>
+{% endblock %}

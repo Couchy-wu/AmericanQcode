@@ -1,0 +1,49 @@
+# Named watchlists for scanning and backtesting
+
+default:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - TSLA
+  - META
+  - NVDA
+
+tech:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - META
+  - NVDA
+  - AMD
+  - INTC
+  - CRM
+  - ADBE
+  - NFLX
+
+sp500_sample:
+  - AAPL
+  - MSFT
+  - GOOGL
+  - AMZN
+  - TSLA
+  - META
+  - NVDA
+  - BRK-B
+  - JPM
+  - V
+  - JNJ
+  - WMT
+  - PG
+  - MA
+  - UNH
+  - HD
+  - BAC
+  - DIS
+  - PYPL
+  - CMCSA
+
+test:
+  - AAPL
+  - MSFT
+  - SPY

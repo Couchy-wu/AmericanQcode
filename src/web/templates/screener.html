@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Screener — AmericanQcode{% endblock %}
+
+{% block content %}
+<div class="screener-page">
+    <div class="panel-header">
+        <h2>Stock Screener</h2>
+        <div class="screener-filters">
+            <select id="filter-strategy">
+                <option value="">All Strategies</option>
+                <option value="macd_cross">MACD Cross</option>
+                <option value="rsi_divergence">RSI Divergence</option>
+                <option value="ma_breakout">MA Breakout</option>
+                <option value="bollinger_squeeze">Bollinger Squeeze</option>
+                <option value="candlestick_pattern">Candlestick Pattern</option>
+            </select>
+            <select id="filter-direction">
+                <option value="">All Directions</option>
+                <option value="BULLISH">Bullish</option>
+                <option value="BEARISH">Bearish</option>
+            </select>
+            <input type="number" id="filter-min-rsi" placeholder="Min RSI" style="width:100px">
+            <input type="number" id="filter-max-rsi" placeholder="Max RSI" style="width:100px">
+            <button id="btn-scan" class="btn-primary">Scan Now</button>
+        </div>
+    </div>
+
+    <table id="screener-table" class="data-table">
+        <thead>
+            <tr>
+                <th>Ticker</th>
+                <th>Price</th>
+                <th>Change%</th>
+                <th>RSI</th>
+                <th>MACD Signal</th>
+                <th>Volume</th>
+                <th>ADX</th>
+                <th>Latest Signal</th>
+            </tr>
+        </thead>
+        <tbody id="screener-body">
+            <tr><td colspan="8" class="empty-state">Click "Scan Now" to load data</td></tr>
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/screener.js"></script>
+{% endblock %}

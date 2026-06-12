@@ -1,0 +1,76 @@
+# Strategy configurations with toggle flags and parameter overrides
+
+strategies:
+  macd_cross:
+    enabled: true
+    timeframe: "1d"
+    min_confidence: 0.6
+    params:
+      fast: 12
+      slow: 26
+      signal: 9
+      require_volume_confirmation: true
+      volume_factor: 1.5
+
+  rsi_divergence:
+    enabled: true
+    timeframe: "1d"
+    min_confidence: 0.65
+    params:
+      period: 14
+      oversold: 30
+      overbought: 70
+      divergence_window: 20
+
+  ma_breakout:
+    enabled: true
+    timeframe: "1d"
+    min_confidence: 0.55
+    params:
+      fast_ma: 20
+      slow_ma: 50
+      volume_factor: 1.5
+
+  bollinger_squeeze:
+    enabled: true
+    timeframe: "1d"
+    min_confidence: 0.6
+    params:
+      period: 20
+      nbdev: 2
+      squeeze_threshold: 0.1   # bandwidth percentile
+
+  candlestick_pattern:
+    enabled: true
+    timeframe: "1d"
+    min_confidence: 0.5
+    params:
+      patterns:
+        - CDLENGULFING
+        - CDLMORNINGSTAR
+        - CDLEVENINGSTAR
+        - CDLHAMMER
+        - CDLSHOOTINGSTAR
+        - CDLDOJI
+        - CDL3WHITESOLDIERS
+        - CDL3BLACKCROWS
+
+  kdj_signal:
+    enabled: true
+    timeframe: "1d"
+    min_confidence: 0.55
+    params:
+      n: 9
+      m1: 3
+      m2: 3
+      oversold: 20
+      overbought: 80
+
+  adx_trend:
+    enabled: true
+    timeframe: "1d"
+    min_confidence: 0.5
+    params:
+      period: 14
+      trend_threshold: 25
+      strong_trend_threshold: 40

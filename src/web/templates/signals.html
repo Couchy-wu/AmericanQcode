@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block title %}Signals — AmericanQcode{% endblock %}
+
+{% block content %}
+<div class="signals-page">
+    <div class="panel-header">
+        <h2>Signal History</h2>
+        <div class="signal-filters">
+            <select id="filter-strategy">
+                <option value="">All Strategies</option>
+                <option value="macd_cross">MACD Cross</option>
+                <option value="rsi_divergence">RSI Divergence</option>
+                <option value="ma_breakout">MA Breakout</option>
+                <option value="bollinger_squeeze">Bollinger Squeeze</option>
+                <option value="candlestick_pattern">Candlestick Pattern</option>
+            </select>
+            <select id="filter-direction">
+                <option value="">All Directions</option>
+                <option value="BULLISH">Bullish</option>
+                <option value="BEARISH">Bearish</option>
+            </select>
+            <button id="btn-refresh" class="btn-primary">Refresh</button>
+        </div>
+    </div>
+
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>Time</th>
+                <th>Ticker</th>
+                <th>Direction</th>
+                <th>Confidence</th>
+                <th>Strategy</th>
+                <th>Price</th>
+                <th>Reasoning</th>
+            </tr>
+        </thead>
+        <tbody id="signals-body">
+            <tr><td colspan="7" class="empty-state">Loading...</td></tr>
+        </tbody>
+    </table>
+
+    <div class="pagination" id="pagination"></div>
+</div>
+{% endblock %}
