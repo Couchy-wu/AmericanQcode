@@ -2,10 +2,12 @@
 # Sensitive values should be set via environment variables or .env file.
 
 providers:
-  primary: yahoo          # yahoo / polygon / alpha_vantage
-  fallback: polygon
-  polygon_api_key: ${POLYGON_API_KEY}
+  primary: finnhub          # finnhub / itick / alpha_vantage / yahoo / polygon
+  fallback: itick
+  finnhub_api_key: ${FINNHUB_API_KEY}
+  itick_api_token: ${ITICK_API_TOKEN}
   alpha_vantage_key: ${ALPHA_VANTAGE_KEY}
+  polygon_api_key: ${POLYGON_API_KEY}
 
 polling:
   interval_minutes: 5

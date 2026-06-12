@@ -110,9 +110,49 @@ def fetch_kline_itick(ticker: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def fetch_kline_alpha_vantage(ticker: str) -> Optional[pd.DataFrame]:
+    """Try Alpha Vantage (5 calls/min, 20+ years history, built-in indicators)."""
+    api_key = os.getenv("ALPHA_VANTAGE_KEY", "")
+    if not api_key:
+        return None
+    try:
+        import requests as req
+        params = {
+            "function": "TIME_SERIES_DAILY_ADJUSTED",
+            "symbol": ticker.upper(),
+            "outputsize": "full",
+            "apikey": api_key,
+        }
+        resp = req.get("https://www.alphavantage.co/query", params=params, timeout=30)
+        data = resp.json()
+        ts_key = "Time Series (Daily)" if "Time Series (Daily)" in data else \
+                 "Time Series (Daily)" if "Time Series (Daily)" in data else None
+        if not ts_key or ts_key not in data:
+            return None
+        rows = []
+        for date_str, vals in data[ts_key].items():
+            rows.append({
+                "timestamp": pd.Timestamp(date_str),
+                "Open": float(vals.get("1. open", 0)),
+                "High": float(vals.get("2. high", 0)),
+                "Low": float(vals.get("3. low", 0)),
+                "Close": float(vals.get("5. adjusted close", vals.get("4. close", 0))),
+                "Volume": float(vals.get("6. volume", 0)),
+            })
+        if len(rows) < 50:
+            return None
+        return pd.DataFrame(rows).set_index("timestamp").sort_index()
+    except Exception:
+        return None
+
+
 def fetch_kline(ticker: str) -> tuple[Optional[pd.DataFrame], str]:
     """Try all K-line providers in order. Returns (df, source_name)."""
-    for fetcher, name in [(fetch_kline_finnhub, "Finnhub"), (fetch_kline_itick, "iTick")]:
+    for fetcher, name in [
+        (fetch_kline_finnhub, "Finnhub"),
+        (fetch_kline_itick, "iTick"),
+        (fetch_kline_alpha_vantage, "AlphaVantage"),
+    ]:
         df = fetcher(ticker)
         if df is not None and len(df) >= 50:
             return df, name
@@ -446,7 +486,8 @@ def allocate(signals, capital, max_positions):
 def main():
     has_finnhub = bool(os.getenv("FINNHUB_API_KEY"))
     has_itick = bool(os.getenv("ITICK_API_TOKEN"))
-    kline_available = has_finnhub or has_itick
+    has_av = bool(os.getenv("ALPHA_VANTAGE_KEY"))
+    kline_available = has_finnhub or has_itick or has_av
 
     print("=" * 90)
     print("  📈 AmericanQcode — 实时持仓推荐")
@@ -456,6 +497,7 @@ def main():
     sources = []
     if has_finnhub: sources.append("Finnhub (K线)")
     if has_itick: sources.append("iTick (K线)")
+    if has_av: sources.append("AlphaVantage (K线)")
     sources.append("Finviz (快照)")
     print(" → ".join(sources))
     if not kline_available:
