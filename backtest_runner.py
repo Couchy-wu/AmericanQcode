@@ -4,13 +4,33 @@ Standalone backtest script — $10,000 capital, 1-year historical data.
 Uses pure pandas/numpy for indicators (no TA-Lib required).
 """
 
+import os
+import sys
+import time
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+# Load .env from project root
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    # Fallback: parse .env manually
+    _env_path = Path(__file__).parent / ".env"
+    if _env_path.exists():
+        for _line in _env_path.read_text().splitlines():
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _k, _v = _line.split("=", 1)
+                os.environ[_k.strip()] = _v.strip()
 
 warnings.filterwarnings("ignore")
 
@@ -1050,28 +1070,126 @@ def _empty_result(strategy: str, ticker: str) -> dict:
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
-def fetch_data(ticker: str) -> Optional[pd.DataFrame]:
-    """Fetch 1-year OHLCV data with retry logic."""
+def fetch_data_alphavantage(ticker: str) -> Optional[pd.DataFrame]:
+    """Fetch 1-year OHLCV from Alpha Vantage via curl (bypasses Python SSL issues)."""
+    import subprocess, json
+    api_key = os.getenv("ALPHA_VANTAGE_KEY", "")
+    if not api_key:
+        return None
+    try:
+        url = (f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY"
+               f"&symbol={ticker.upper()}&outputsize=compact&apikey={api_key}")
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", "30", url],
+            capture_output=True, text=True, timeout=35,
+        )
+        data = json.loads(result.stdout)
+        ts_key = "Time Series (Daily)"
+        if ts_key not in data:
+            return None
+        rows = []
+        cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS + 30)
+        for date_str, vals in data[ts_key].items():
+            dt = pd.Timestamp(date_str)
+            if dt < cutoff:
+                continue
+            rows.append({
+                "timestamp": dt,
+                "Open": float(vals.get("1. open", 0)),
+                "High": float(vals.get("2. high", 0)),
+                "Low": float(vals.get("3. low", 0)),
+                "Close": float(vals.get("4. close", 0)),
+                "Volume": float(vals.get("6. volume", 0)),
+            })
+        if len(rows) < 50:
+            return None
+        df = pd.DataFrame(rows).set_index("timestamp").sort_index()
+        return df
+    except Exception:
+        return None
+
+
+def fetch_data_yahoo(ticker: str) -> Optional[pd.DataFrame]:
+    """Fetch 1-year OHLCV data from Yahoo Finance (fallback)."""
     end = datetime.now()
     start = end - timedelta(days=LOOKBACK_DAYS)
-    for attempt in range(4):
+    for attempt in range(2):
         try:
             df = yf.download(
-                ticker,
-                start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"),
-                interval="1d",
-                progress=False,
-                auto_adjust=True,
+                ticker, start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"),
+                interval="1d", progress=False, auto_adjust=True,
             )
             if not df.empty and len(df) >= 50:
                 cols = ["Open", "High", "Low", "Close", "Volume"]
                 df = df[[c for c in cols if c in df.columns]]
                 return df
         except Exception:
-            import time
-            time.sleep(5 * (attempt + 1))
+            time.sleep(5)
     return None
+
+
+# Alpha Vantage rate limit: 5 calls/min = 12 sec between calls
+_av_last_call = 0.0
+
+def fetch_data_eodhd(ticker: str) -> Optional[pd.DataFrame]:
+    """Fetch OHLCV from EODHD — demo key works without registration (20 calls/day)."""
+    import subprocess, json
+    try:
+        url = f"https://eodhd.com/api/eod/{ticker.upper()}.US?api_token=demo&fmt=json&period=d"
+        result = subprocess.run(
+            ["curl", "-s", "--max-time", "30", url],
+            capture_output=True, text=True, timeout=35,
+        )
+        data = json.loads(result.stdout)
+        if not isinstance(data, list) or len(data) < 50:
+            return None
+        rows = []
+        cutoff = datetime.now() - timedelta(days=LOOKBACK_DAYS + 30)
+        for bar in data:
+            dt = pd.Timestamp(bar["date"])
+            if dt < cutoff:
+                continue
+            rows.append({
+                "timestamp": dt,
+                "Open": float(bar["open"]),
+                "High": float(bar["high"]),
+                "Low": float(bar["low"]),
+                "Close": float(bar["adjusted_close"] if bar.get("adjusted_close") else bar["close"]),
+                "Volume": float(bar.get("volume", 0)),
+            })
+        if len(rows) < 50:
+            return None
+        return pd.DataFrame(rows).set_index("timestamp").sort_index()
+    except Exception:
+        return None
+
+
+def fetch_data(ticker: str) -> tuple[Optional[pd.DataFrame], str]:
+    """Fetch 1-year OHLCV, trying EODHD → Alpha Vantage → Yahoo."""
+    global _av_last_call
+
+    # 1. EODHD demo key (20 calls/day, full history, no registration)
+    df = fetch_data_eodhd(ticker)
+    if df is not None and len(df) >= 50:
+        return df, "EODHD"
+
+    # 2. Alpha Vantage (with rate limiting)
+    api_key = os.getenv("ALPHA_VANTAGE_KEY", "")
+    if api_key:
+        elapsed = time.monotonic() - _av_last_call
+        if elapsed < 13:
+            time.sleep(13 - elapsed)
+        _av_last_call = time.monotonic()
+        df = fetch_data_alphavantage(ticker)
+        if df is not None and len(df) >= 50:
+            return df, "AlphaVantage"
+
+    # 3. Yahoo fallback
+    df = fetch_data_yahoo(ticker)
+    if df is not None:
+        return df, "Yahoo"
+
+    return None, "none"
 
 
 def generate_synthetic_data(ticker_seed: str, trend: float = 0.02) -> pd.DataFrame:
@@ -1147,15 +1265,17 @@ def main():
     all_results_stops = []
 
     for ticker in TICKERS:
-        print(f"\n🔍 正在获取 {ticker} 数据...", end=" ", flush=True)
-        df = fetch_data(ticker)
+        print(f"\n🔍 {ticker} ...", end=" ", flush=True)
+        df, source = fetch_data(ticker)
         use_synthetic = False
         if df is None:
-            print("⚠️ Yahoo限流，使用模拟数据", end=" ", flush=True)
+            print("⚠️ 无API数据，使用模拟", end=" ", flush=True)
             df = generate_synthetic_data(ticker)
             use_synthetic = True
+            source = "模拟"
 
-        print(f"✅ {len(df)} 根K线 (${df['Close'].iloc[-1]:.2f}){' [模拟]' if use_synthetic else ''}")
+        src_tag = f"[{source}]"
+        print(f"✅ {len(df)} 根K线 (${df['Close'].iloc[-1]:.2f}) {src_tag}")
         if use_synthetic:
             synthetic_mode = True
 
