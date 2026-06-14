@@ -1164,11 +1164,45 @@ def fetch_data_eodhd(ticker: str) -> Optional[pd.DataFrame]:
         return None
 
 
+def fetch_data_tiingo(ticker: str) -> Optional[pd.DataFrame]:
+    """Fetch OHLCV from Tiingo (1000 calls/month, full history, adjusted prices)."""
+    import subprocess, json
+    api_key = os.getenv("TIINGO_API_KEY", "")
+    if not api_key:
+        return None
+    try:
+        start_str = (datetime.now() - timedelta(days=LOOKBACK_DAYS + 60)).strftime("%Y-%m-%d")
+        url = f"https://api.tiingo.com/tiingo/daily/{ticker.upper()}/prices?startDate={start_str}&token={api_key}"
+        result = subprocess.run(["curl", "-s", "--max-time", "15", url], capture_output=True, text=True, timeout=20)
+        data = json.loads(result.stdout)
+        if not isinstance(data, list) or len(data) < 50:
+            return None
+        rows = []
+        for bar in data:
+            rows.append({
+                "timestamp": pd.Timestamp(bar["date"]),
+                "Open": float(bar["adjOpen"]),
+                "High": float(bar["adjHigh"]),
+                "Low": float(bar["adjLow"]),
+                "Close": float(bar["adjClose"]),
+                "Volume": float(bar["adjVolume"]),
+            })
+        df = pd.DataFrame(rows).set_index("timestamp").sort_index()
+        return df if len(df) >= 50 else None
+    except Exception:
+        return None
+
+
 def fetch_data(ticker: str) -> tuple[Optional[pd.DataFrame], str]:
-    """Fetch 1-year OHLCV, trying EODHD → Alpha Vantage → Yahoo."""
+    """Fetch 1-year OHLCV, trying Tiingo → EODHD → Alpha Vantage → Yahoo."""
     global _av_last_call
 
-    # 1. EODHD demo key (20 calls/day, full history, no registration)
+    # 1. Tiingo (1000 calls/month, full adjusted history)
+    df = fetch_data_tiingo(ticker)
+    if df is not None and len(df) >= 50:
+        return df, "Tiingo"
+
+    # 2. EODHD demo key (20 calls/day, full history, no registration)
     df = fetch_data_eodhd(ticker)
     if df is not None and len(df) >= 50:
         return df, "EODHD"
