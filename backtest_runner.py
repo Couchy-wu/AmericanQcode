@@ -733,8 +733,45 @@ ALL_STRATEGIES = {
 # ─── Backtest Engine ─────────────────────────────────────────────────────────
 
 
-def run_backtest(df: pd.DataFrame, signals: list[dict], ticker: str, strategy_name: str) -> dict:
-    """Run a simple backtest: buy on BULLISH signals, sell on BEARISH signals."""
+def run_backtest(
+    df: pd.DataFrame,
+    signals: list[dict],
+    ticker: str,
+    strategy_name: str,
+    use_stops: bool = True,
+    atr_stop_mult: float = 2.5,
+    trailing_pct: float = 0.06,
+    rr_ratio: float = 2.5,
+    max_hold_bars: int = 40,
+    initial_stop_pct: float = 0.08,
+    trailing_tp: bool = True,
+    tp_base_margin: float = 0.06,
+    tp_scale_factor: float = 1.5,
+    tp_scale_threshold: float = 0.10,
+) -> dict:
+    """Backtest with dynamic stop-loss and take-profit.
+
+    Dynamic Risk Management:
+      1. Initial Stop Loss: Hard stop at entry_price * (1 - initial_stop_pct)
+      2. Trailing Stop (ATR): Exit if price < highest_since_entry - atr_stop_mult * ATR
+      3. Take Profit (R:R): Exit when profit >= initial_risk * rr_ratio
+      4. Trailing Take-Profit: When trend intact, take-profit target trails price upward
+         ─ 趋势不变时，止盈线上移，让利润奔跑
+      5. Time Stop: Exit after max_hold_bars if no other exit triggered
+      6. Signal Exit: Opposite signal still closes position
+
+    Args:
+        use_stops: If False, falls back to signal-only exits (original behavior).
+        atr_stop_mult: ATR multiplier for trailing stop (higher = wider stop).
+        trailing_pct: Fallback trailing % if ATR unavailable.
+        rr_ratio: Risk:Reward target (e.g., 2.5 means target = risk * 2.5).
+        max_hold_bars: Max bars to hold before forced exit.
+        initial_stop_pct: Max loss % from entry before hard stop.
+        trailing_tp: Enable trailing take-profit (动态止盈上移).
+        tp_base_margin: Base margin above current price for trailing TP (e.g., 0.06 = 6%).
+        tp_scale_factor: When profit > tp_scale_threshold, widen TP margin by this factor.
+        tp_scale_threshold: Profit % at which to start scaling TP margin.
+    """
     if df.empty or not signals:
         return _empty_result(strategy_name, ticker)
 
@@ -743,20 +780,131 @@ def run_backtest(df: pd.DataFrame, signals: list[dict], ticker: str, strategy_na
     sig_df["timestamp"] = pd.to_datetime(sig_df["timestamp"])
     sig_df = sig_df.set_index("timestamp").sort_index()
 
+    # Pre-compute ATR for dynamic stops
+    if use_stops and "High" in df.columns and "Low" in df.columns and "Close" in df.columns:
+        h, l, c = df["High"], df["Low"], df["Close"]
+        tr1 = h - l
+        tr2 = (h - c.shift(1)).abs()
+        tr3 = (l - c.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr_series = tr.ewm(span=14, adjust=False).mean()
+    else:
+        atr_series = pd.Series(0.0, index=df.index)
+
     cash = INITIAL_CAPITAL
     position = 0.0
     entry_price = 0.0
+    highest_since_entry = 0.0
+    bars_held = 0
+    initial_stop = 0.0
+    initial_risk = 0.0
+    take_profit_price = 0.0
+    trailing_tp_price = 0.0        # 动态追踪止盈价（只上移不下移）
+    highest_profit_pct = 0.0        # 持仓期间达到的最高盈利百分比
     equity_curve = []
     trades = []
 
+    exit_reasons = {"signal": 0, "trailing_stop": 0, "take_profit": 0, "trailing_tp": 0, "initial_stop": 0, "time_stop": 0, "eod": 0}
+
     for i, (ts, bar) in enumerate(df.iterrows()):
         price = float(bar["Close"])
+        atr_val = float(atr_series.iloc[i]) if i < len(atr_series) else 0.0
 
-        # Check for signals
+        # ── Check dynamic exits (when in position) ──
+        if position > 0 and use_stops:
+            exit_reason = None
+            exit_price = price
+
+            # Update trailing high
+            if price > highest_since_entry:
+                highest_since_entry = price
+
+            # 1. Initial hard stop
+            if price <= initial_stop:
+                exit_reason = "initial_stop"
+                exit_price = initial_stop  # Assume we can exit at stop
+
+            # 2. Trailing stop (ATR-based preferred, %-based fallback)
+            elif atr_val > 0:
+                trailing_stop = highest_since_entry - atr_stop_mult * atr_val
+                if price <= trailing_stop:
+                    exit_reason = "trailing_stop"
+            elif highest_since_entry > entry_price:
+                trailing_stop = highest_since_entry * (1 - trailing_pct)
+                if price <= trailing_stop:
+                    exit_reason = "trailing_stop"
+
+            # 3. 动态追踪止盈 + 固定止盈
+            #    趋势完好 → 止盈线随价格上涨而上移（让利润奔跑）
+            #    趋势转弱 → 保留固定止盈作为保底
+            tp_was_trailing = False
+            if position > 0 and use_stops:
+                current_profit_pct = (price / entry_price - 1)
+                if current_profit_pct > highest_profit_pct:
+                    highest_profit_pct = current_profit_pct
+
+                # 趋势确认
+                has_adx = "ADX" in bar and not pd.isna(bar.get("ADX", float('nan')))
+                has_ma = "MA_20" in bar and not pd.isna(bar.get("MA_20", float('nan')))
+                adx_val = float(bar["ADX"]) if has_adx else 0
+                ma20_val = float(bar["MA_20"]) if has_ma else 0
+
+                trend_intact = True
+                if has_adx and adx_val <= 20:
+                    trend_intact = False
+                if has_ma and price <= ma20_val:
+                    trend_intact = False
+
+                # 趋势完好 + 已有可观盈利 → 上移止盈目标
+                if trailing_tp and trend_intact and current_profit_pct > 0.02:
+                    margin = tp_base_margin
+                    if current_profit_pct > tp_scale_threshold:
+                        margin *= tp_scale_factor  # 盈利超阈值 → 给更多空间
+
+                    new_target = price * (1 + margin)
+                    if new_target > trailing_tp_price:
+                        trailing_tp_price = new_target
+
+                    # 追踪价高于固定止盈 → 取代之
+                    if trailing_tp_price > take_profit_price:
+                        take_profit_price = trailing_tp_price
+                        tp_was_trailing = True
+
+                # 价格触及止盈价 → 退出
+                if take_profit_price > 0 and price >= take_profit_price:
+                    exit_reason = "trailing_tp" if tp_was_trailing else "take_profit"
+
+            # 5. Time stop
+            if bars_held >= max_hold_bars:
+                exit_reason = "time_stop"
+
+            # Execute exit if triggered
+            if exit_reason:
+                exit_px = exit_price * (1 - SLIPPAGE_BPS / 10000)
+                pnl = (exit_px - entry_price) * position - COMMISSION * position
+                pnl_pct = (exit_px / entry_price - 1) * 100
+                cash += exit_px * position
+                trades.append({
+                    "pnl": pnl, "pnl_pct": pnl_pct,
+                    "exit_price": exit_px, "entry_price": entry_price,
+                    "qty": position, "bars_held": bars_held, "exit_reason": exit_reason,
+                })
+                exit_reasons[exit_reason] = exit_reasons.get(exit_reason, 0) + 1
+                position = 0.0
+                entry_price = 0.0
+                highest_since_entry = 0.0
+                bars_held = 0
+                initial_stop = 0.0
+                initial_risk = 0.0
+                take_profit_price = 0.0
+                trailing_tp_price = 0.0
+                highest_profit_pct = 0.0
+
+        # ── Check for signals ──
         if ts in sig_df.index:
             sigs = sig_df.loc[ts]
             if isinstance(sigs, pd.DataFrame):
-                sigs = sigs.iloc[-1]  # Take latest if multiple
+                sigs = sigs.iloc[-1]
 
             direction = sigs.get("direction", "BULLISH") if isinstance(sigs, pd.Series) else sigs["direction"]
 
@@ -766,9 +914,21 @@ def run_backtest(df: pd.DataFrame, signals: list[dict], ticker: str, strategy_na
                 pnl = (exit_px - entry_price) * position - COMMISSION * position
                 pnl_pct = (exit_px / entry_price - 1) * 100
                 cash += exit_px * position
-                trades.append({"pnl": pnl, "pnl_pct": pnl_pct, "exit_price": exit_px,
-                               "entry_price": entry_price, "qty": position})
+                trades.append({
+                    "pnl": pnl, "pnl_pct": pnl_pct,
+                    "exit_price": exit_px, "entry_price": entry_price,
+                    "qty": position, "bars_held": bars_held, "exit_reason": "signal",
+                })
+                exit_reasons["signal"] += 1
                 position = 0.0
+                entry_price = 0.0
+                highest_since_entry = 0.0
+                bars_held = 0
+                initial_stop = 0.0
+                initial_risk = 0.0
+                take_profit_price = 0.0
+                trailing_tp_price = 0.0
+                highest_profit_pct = 0.0
 
             # Open long on bullish
             if position == 0 and direction == "BULLISH":
@@ -776,25 +936,56 @@ def run_backtest(df: pd.DataFrame, signals: list[dict], ticker: str, strategy_na
                 position_dollars = cash * POSITION_SIZE_PCT
                 position = position_dollars / entry_price
                 cash -= entry_price * position + COMMISSION * position
-                trades.append({"pnl": 0, "pnl_pct": 0, "exit_price": entry_price,
-                               "entry_price": entry_price, "qty": position})
 
+                # Set dynamic stops
+                if use_stops:
+                    highest_since_entry = entry_price
+                    bars_held = 0
+                    trailing_tp_price = 0.0
+                    highest_profit_pct = 0.0
+                    # Initial stop: entry - X% or entry - ATR*mult
+                    if atr_val > 0:
+                        initial_stop = entry_price - atr_stop_mult * atr_val
+                        initial_risk = entry_price - initial_stop
+                    else:
+                        initial_stop = entry_price * (1 - initial_stop_pct)
+                        initial_risk = entry_price * initial_stop_pct
+                    # Take profit based on R:R (baseline, trailing TP will override)
+                    take_profit_price = entry_price + initial_risk * rr_ratio
+
+                trades.append({
+                    "pnl": 0, "pnl_pct": 0, "exit_price": entry_price,
+                    "entry_price": entry_price, "qty": position,
+                    "bars_held": 0, "exit_reason": "entry",
+                })
+
+        # Track equity
         equity = cash + position * price
         equity_curve.append(equity)
+
+        # Increment holding counter
+        if position > 0:
+            bars_held += 1
 
     # Close any open position at last price
     if position > 0:
         last_price = float(df["Close"].iloc[-1])
         pnl = (last_price - entry_price) * position - COMMISSION * position
         cash += last_price * position
+        trades.append({
+            "pnl": pnl, "pnl_pct": (last_price/entry_price - 1) * 100,
+            "exit_price": last_price, "entry_price": entry_price,
+            "qty": position, "bars_held": bars_held, "exit_reason": "eod",
+        })
         position = 0.0
+
+    # ─── Compute metrics ──────────────────────────────────────────────────
 
     final_equity = cash
     total_return = (final_equity / INITIAL_CAPITAL) - 1
     eq_series = pd.Series(equity_curve)
     returns = eq_series.pct_change().dropna()
 
-    # Metrics
     closed_trades = [t for t in trades if t["pnl"] != 0]
     wins = [t for t in closed_trades if t["pnl"] > 0]
     losses = [t for t in closed_trades if t["pnl"] < 0]
@@ -817,6 +1008,13 @@ def run_backtest(df: pd.DataFrame, signals: list[dict], ticker: str, strategy_na
     win_rate = len(wins) / len(closed_trades) if closed_trades else 0.0
     profit_factor = (sum(t["pnl"] for t in wins) / abs(sum(t["pnl"] for t in losses))) if losses else float("inf")
 
+    # Average holding bars
+    avg_bars = sum(t.get("bars_held", 0) for t in closed_trades) / len(closed_trades) if closed_trades else 0
+
+    # Stopout analysis
+    stop_outs = sum(1 for t in closed_trades if t.get("exit_reason", "") in ("trailing_stop", "initial_stop"))
+    tp_outs = sum(1 for t in closed_trades if t.get("exit_reason", "") == "take_profit")
+
     return {
         "strategy": strategy_name, "ticker": ticker,
         "start": df.index[0], "end": df.index[-1],
@@ -832,6 +1030,10 @@ def run_backtest(df: pd.DataFrame, signals: list[dict], ticker: str, strategy_na
         "profit_factor": round(profit_factor, 2) if profit_factor != float("inf") else "∞",
         "best_trade": round(max([t["pnl"] for t in closed_trades], default=0), 2),
         "worst_trade": round(min([t["pnl"] for t in closed_trades], default=0), 2),
+        "avg_bars": round(avg_bars, 1),
+        "stop_outs": stop_outs,
+        "tp_outs": tp_outs,
+        "exit_reasons": exit_reasons,
     }
 
 
@@ -933,19 +1135,22 @@ def main():
     synthetic_mode = False
 
     print("=" * 90)
-    print("  📈 AmericanQcode — 策略回测报告")
+    print("  📈 AmericanQcode — 策略回测报告（含动态止盈止损）")
     print(f"  💰 初始资金: ${INITIAL_CAPITAL:,.0f}  |  📅 回测周期: {start_date.strftime('%Y-%m-%d')} → {end_date.strftime('%Y-%m-%d')}")
     print(f"  📊 每笔仓位: {POSITION_SIZE_PCT * 100:.0f}%  |  🏷️  滑点: {SLIPPAGE_BPS}bps  |  佣金: ${COMMISSION}/股")
+    print(f"  🛡️ 止损: ATR(14)×3.0 | 追踪-8% | 硬止损:-10% | 最大持仓:60K")
+    print(f"  🎯 止盈: R:R=3.0(保底) + 动态追踪(+6%, 盈利>10%时放宽到+9%)")
+    print(f"  📐 风格: 趋势不变→止盈线自动上移, 让利润充分奔跑")
     print("=" * 90)
 
-    all_results = []
+    all_results_original = []
+    all_results_stops = []
 
     for ticker in TICKERS:
         print(f"\n🔍 正在获取 {ticker} 数据...", end=" ", flush=True)
         df = fetch_data(ticker)
         use_synthetic = False
         if df is None:
-            # Fallback to synthetic data if Yahoo rate-limited
             print("⚠️ Yahoo限流，使用模拟数据", end=" ", flush=True)
             df = generate_synthetic_data(ticker)
             use_synthetic = True
@@ -957,94 +1162,169 @@ def main():
         # Compute indicators
         df = compute_all_indicators(df)
 
-        # Run each strategy
+        # Run each strategy — BOTH versions
         for sname, sfunc in ALL_STRATEGIES.items():
             signals = sfunc(df)
             if not signals:
                 continue
-            result = run_backtest(df, signals, ticker, sname)
-            all_results.append(result)
+            # Original (no stops)
+            result_no_stops = run_backtest(df, signals, ticker, f"{sname} (原始)", use_stops=False)
+            all_results_original.append(result_no_stops)
+            # Enhanced (with conservative dynamic stops + trailing take-profit)
+            result_stops = run_backtest(
+                df, signals, ticker, sname, use_stops=True,
+                atr_stop_mult=3.0,          # 宽松ATR追踪
+                trailing_pct=0.08,           # 8% 追踪止损
+                rr_ratio=3.0,                # 1:3 风险回报(保底)
+                max_hold_bars=60,            # 最多60根K线
+                initial_stop_pct=0.10,       # 10% 硬止损
+                trailing_tp=True,            # ✅ 动态追踪止盈
+                tp_base_margin=0.06,         # 止盈线=当前价+6%
+                tp_scale_factor=1.5,         # 盈利>10%后放宽到9%
+                tp_scale_threshold=0.10,     # 盈利阈值10%
+            )
+            all_results_stops.append(result_stops)
 
-    if not all_results:
+    if not all_results_stops:
         print("\n❌ 无回测结果")
         return
 
-    # ─── Best & worst by strategy ─────────────────────────────────────────────
+    # ─── Comparison by strategy ───────────────────────────────────────────────
 
     print("\n" + "=" * 90)
-    print("  📋 各策略汇总 (按平均收益排序)")
+    print("  📋 策略对比：原始 vs 动态止盈止损")
     print("=" * 90)
 
-    # Group by strategy
     from collections import defaultdict
-    by_strategy = defaultdict(list)
-    for r in all_results:
-        by_strategy[r["strategy"]].append(r)
+
+    # Group by strategy name (strip suffix for grouping)
+    by_strategy_orig = defaultdict(list)
+    for r in all_results_original:
+        name = r["strategy"].replace(" (原始)", "")
+        by_strategy_orig[name].append(r)
+
+    by_strategy_stops = defaultdict(list)
+    for r in all_results_stops:
+        by_strategy_stops[r["strategy"]].append(r)
+
+    print(f"\n{'策略':<22} {'版本':>8} {'平均收益':>10} {'夏普':>8} {'胜率':>8} {'最大回撤':>9} {'交易数':>7} {'平均持仓':>8} {'止损触发':>8} {'止盈触发':>8}")
+    print("-" * 108)
 
     strategy_summary = []
-    for sname, results in by_strategy.items():
-        avg_ret = np.mean([r["total_return_pct"] for r in results])
-        avg_sharpe = np.mean([r["sharpe"] for r in results])
-        avg_win = np.mean([r["win_rate_pct"] for r in results if r["total_trades"] > 0])
-        total_tr = sum(r["total_trades"] for r in results)
-        profitable = sum(1 for r in results if r["total_return_pct"] > 0)
+    for sname in sorted(by_strategy_stops.keys()):
+        orig_list = by_strategy_orig.get(sname, [])
+        stop_list = by_strategy_stops.get(sname, [])
+
+        # Original
+        if orig_list:
+            avg_ret_o = np.mean([r["total_return_pct"] for r in orig_list])
+            avg_sh_o = np.mean([r["sharpe"] for r in orig_list])
+            avg_wr_o = np.mean([r["win_rate_pct"] for r in orig_list if r["total_trades"] > 0])
+            avg_dd_o = np.mean([r["max_drawdown_pct"] for r in orig_list])
+            total_tr_o = sum(r["total_trades"] for r in orig_list)
+        else:
+            avg_ret_o = avg_sh_o = avg_wr_o = avg_dd_o = total_tr_o = 0
+
+        # With stops
+        if stop_list:
+            avg_ret_s = np.mean([r["total_return_pct"] for r in stop_list])
+            avg_sh_s = np.mean([r["sharpe"] for r in stop_list])
+            avg_wr_s = np.mean([r["win_rate_pct"] for r in stop_list if r["total_trades"] > 0])
+            avg_dd_s = np.mean([r["max_drawdown_pct"] for r in stop_list])
+            total_tr_s = sum(r["total_trades"] for r in stop_list)
+            avg_bars = np.mean([r["avg_bars"] for r in stop_list])
+            stops_triggered = sum(r["stop_outs"] for r in stop_list)
+            tps_triggered = sum(r["tp_outs"] for r in stop_list)
+        else:
+            avg_ret_s = avg_sh_s = avg_wr_s = avg_dd_s = total_tr_s = 0
+            avg_bars = stops_triggered = tps_triggered = 0
+
+        # Color the change
+        delta_ret = avg_ret_s - avg_ret_o
+        delta_color = "🟢" if delta_ret > 0 else ("🔴" if delta_ret < -1 else "⚪")
+        dd_improved = avg_dd_o - avg_dd_s  # positive = less drawdown
+
+        ret_o_str = f"{avg_ret_o:>+9.2f}%"
+        ret_s_str = f"{avg_ret_s:>+9.2f}%"
+        dd_o_str = f"{avg_dd_o:>8.2f}%"
+        dd_s_str = f"{avg_dd_s:>8.2f}%"
+
+        # Print original row
+        o_color = "🟢" if avg_ret_o > 0 else "🔴"
+        print(f"{o_color} {sname:<19} {'原始':>8} {ret_o_str} {avg_sh_o:>7.2f} {avg_wr_o:>7.1f}% {dd_o_str} {total_tr_o:>7}")
+
+        # Print enhanced row
+        print(f"   {'':>19} {delta_color} {'动态止损':>6} {ret_s_str} {avg_sh_s:>7.2f} {avg_wr_s:>7.1f}% {dd_s_str} {total_tr_s:>7} {avg_bars:>7.1f}天 {stops_triggered:>8} {tps_triggered:>8}")
+        if dd_improved > 0:
+            print(f"   {'':>19} {'':>8} {'回撤改善':>10} {dd_improved:>+8.2f}%")
+
         strategy_summary.append({
             "strategy": sname,
-            "tickers": len(results),
-            "avg_return": avg_ret,
-            "avg_sharpe": avg_sharpe,
-            "avg_winrate": avg_win,
-            "profitable": profitable,
-            "total_trades": total_tr,
+            "orig_return": avg_ret_o,
+            "stop_return": avg_ret_s,
+            "delta": delta_ret,
+            "dd_improved": dd_improved,
+            "stops_triggered": stops_triggered,
+            "tps_triggered": tps_triggered,
         })
 
-    strategy_summary.sort(key=lambda x: x["avg_return"], reverse=True)
-
-    # Pretty print table
-    print(f"\n{'策略':<18} {'标的数':>6} {'盈利数':>6} {'平均收益':>10} {'夏普':>8} {'胜率':>8} {'总交易':>8}")
-    print("-" * 70)
-    for s in strategy_summary:
-        ret_color = "🟢" if s["avg_return"] > 0 else "🔴"
-        print(f"{ret_color} {s['strategy']:<15} {s['tickers']:>6} {s['profitable']:>6} "
-              f"{s['avg_return']:>+9.2f}% {s['avg_sharpe']:>7.2f} {s['avg_winrate']:>7.1f}% {s['total_trades']:>8}")
-
-    # ─── Top individual results ────────────────────────────────────────────────
+    # ─── Summary ──────────────────────────────────────────────────────────────
 
     print("\n" + "=" * 90)
-    print("  🏆 单笔最佳回测 Top 10 (按收益率排序)")
+    print("  📊 动态止盈止损效果总结")
     print("=" * 90)
 
-    all_results.sort(key=lambda x: x["total_return_pct"], reverse=True)
-    top10 = all_results[:10]
+    avg_delta = np.mean([s["delta"] for s in strategy_summary])
+    avg_dd_improve = np.mean([s["dd_improved"] for s in strategy_summary if s["dd_improved"] > 0])
+    total_stops = sum(s["stops_triggered"] for s in strategy_summary)
+    total_tps = sum(s["tps_triggered"] for s in strategy_summary)
 
-    print(f"\n{'排名':<5} {'标的':<6} {'策略':<18} {'收益':>8} {'夏普':>6} {'最大回撤':>9} {'胜率':>7} {'交易数':>6} {'盈亏比':>7}")
-    print("-" * 80)
+    print(f"\n  平均收益提升: {avg_delta:+.2f}%")
+    print(f"  平均回撤改善: {avg_dd_improve:.2f}%")
+    print(f"  止损触发次数: {total_stops} (控制亏损)")
+    print(f"  止盈触发次数: {total_tps} (锁定利润)")
+    print(f"\n  💡 动态止损 = ATR(14) × 3.0 追踪 + -10% 硬止损（保守风格）")
+    print(f"  💡 动态止盈 = 初始风险 × 3.0 (R:R)")
+    print(f"  💡 时间止损 = 持仓超过 60 根K线强制平仓")
+
+    # ─── Top individual results (with stops) ──────────────────────────────────
+
+    print("\n" + "=" * 90)
+    print("  🏆 单笔最佳回测 Top 10 (动态止盈止损版)")
+    print("=" * 90)
+
+    all_results_stops.sort(key=lambda x: x["total_return_pct"], reverse=True)
+    top10 = all_results_stops[:10]
+
+    print(f"\n{'排名':<5} {'标的':<6} {'策略':<22} {'收益':>8} {'夏普':>6} {'最大回撤':>9} {'胜率':>7} {'交易':>5} {'止损':>5} {'止盈':>5} {'持仓':>5}")
+    print("-" * 100)
     for rank, r in enumerate(top10, 1):
         ret_icon = "🟢" if r["total_return_pct"] > 0 else "🔴"
-        print(f"{ret_icon} {rank:<3} {r['ticker']:<6} {r['strategy']:<18} "
+        print(f"{ret_icon} {rank:<3} {r['ticker']:<6} {r['strategy']:<22} "
               f"{r['total_return_pct']:>+7.2f}% {r['sharpe']:>5.2f} {r['max_drawdown_pct']:>8.2f}% "
-              f"{r['win_rate_pct']:>6.1f}% {r['total_trades']:>6} {str(r['profit_factor']):>7}")
+              f"{r['win_rate_pct']:>6.1f}% {r['total_trades']:>5} {r['stop_outs']:>5} {r['tp_outs']:>5} {r['avg_bars']:>4.0f}天")
 
     # ─── Worst performers ──────────────────────────────────────────────────────
 
     print("\n" + "=" * 90)
-    print("  ⚠️  表现最差 Top 5")
+    print("  ⚠️  表现最差 Top 5 (动态止盈止损版)")
     print("=" * 90)
-    for rank, r in enumerate(all_results[-5:], 1):
-        print(f"  {rank}. {r['ticker']:<6} {r['strategy']:<18} "
-              f"{r['total_return_pct']:>+7.2f}%  |  夏普: {r['sharpe']:.2f}  |  最大回撤: {r['max_drawdown_pct']:.2f}%")
+    for rank, r in enumerate(all_results_stops[-5:], 1):
+        reason_breakdown = ", ".join(f"{k}:{v}" for k, v in r.get("exit_reasons", {}).items() if v > 0)
+        print(f"  {rank}. {r['ticker']:<6} {r['strategy']:<22} "
+              f"{r['total_return_pct']:>+7.2f}%  |  夏普: {r['sharpe']:.2f}  |  回撤: {r['max_drawdown_pct']:.2f}%"
+              f"  |  退出: {reason_breakdown}")
 
-    # ─── Capital evolution example ─────────────────────────────────────────────
+    # ─── Capital evolution ────────────────────────────────────────────────────
 
     print("\n" + "=" * 90)
-    print("  💵 资金演变 (以最佳结果为例)")
+    print("  💵 资金演变")
     print("=" * 90)
     best = top10[0]
-    print(f"  {best['ticker']} + {best['strategy']}: "
+    print(f"  🥇 {best['ticker']} + {best['strategy']}: "
           f"${best['initial_capital']:,.0f} → ${best['final_capital']:,.2f} "
           f"({best['total_return_pct']:+.2f}%)")
-    if best["total_return_pct"] > 0:
-        print(f"  💡 如果这个策略持续有效，一年的理论收益为: ${best['final_capital'] - best['initial_capital']:,.2f}")
+    print(f"     止损触发: {best['stop_outs']}次  |  止盈触发: {best['tp_outs']}次  |  平均持仓: {best['avg_bars']}天")
 
 
 if __name__ == "__main__":
